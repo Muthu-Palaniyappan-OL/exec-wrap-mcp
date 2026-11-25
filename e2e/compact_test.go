@@ -31,8 +31,8 @@ func TestCompactTextMode(t *testing.T) {
 	if _, text, _ = c.call("send", map[string]any{"session_id": id, "input": "false; echo x"}); text != "x" {
 		t.Fatalf("got %q", text)
 	}
-	_, text, _ = c.call("send", map[string]any{"session_id": id, "input": "ls /nonexistent-dir"})
-	if !strings.HasSuffix(text, "\n[exit 1]") {
+	_, text, _ = c.call("send", map[string]any{"session_id": id, "input": "sh -c 'echo oops; exit 3'"})
+	if text != "oops\n[exit 3]" {
 		t.Fatalf("got %q", text)
 	}
 	if got := c.toolNames(); strings.Join(got, ",") != "kill,launch,list,send" {
