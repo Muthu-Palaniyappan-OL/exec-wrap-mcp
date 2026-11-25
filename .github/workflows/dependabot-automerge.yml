@@ -1,0 +1,33 @@
+name: Dependabot auto-merge
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'Muthu-Palaniyappan-OL/exec-wrap-mcp'
+    runs-on: ubuntu-latest
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Minor/patch updates, and any update that fixes a known vulnerability
+      # (GHSA/CVE), are merged automatically once the required CI check passes.
+      - name: Enable auto-merge
+        if: steps.meta.outputs.update-type != 'version-update:semver-major' || steps.meta.outputs.ghsa-id != ''
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Label major updates for manual review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major' && steps.meta.outputs.ghsa-id == ''
+        run: gh pr edit "$PR_URL" --add-label "needs-review"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,6 @@
+/exec-wrap-mcp
+/exec-wrap-mcp.exe
+/dist/
+*.test
+*.out
+.DS_Store
