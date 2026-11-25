@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"testing"
 	"time"
 
@@ -39,7 +40,14 @@ type client struct {
 	cs *mcp.ClientSession
 }
 
+// newClient starts the server with --structured so tests can assert on fields.
 func newClient(t *testing.T, args ...string) *client {
+	t.Helper()
+	return newTextClient(t, append([]string{"--structured"}, args...)...)
+}
+
+// newTextClient starts the server in its default compact, text-only mode.
+func newTextClient(t *testing.T, args ...string) *client {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
@@ -50,6 +58,16 @@ func newClient(t *testing.T, args ...string) *client {
 	}
 	t.Cleanup(func() { _ = cs.Close() })
 	return &client{t: t, cs: cs}
+}
+
+func (c *client) toolsJSON() []byte {
+	c.t.Helper()
+	res, err := c.cs.ListTools(context.Background(), nil)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	b, _ := json.Marshal(res.Tools)
+	return b
 }
 
 // call invokes a tool and decodes structured output into a map.
@@ -82,4 +100,18 @@ func (c *client) mustCall(name string, args map[string]any) map[string]any {
 		c.t.Fatalf("%s returned error: %s", name, text)
 	}
 	return out
+}
+
+func (c *client) toolNames() []string {
+	c.t.Helper()
+	res, err := c.cs.ListTools(context.Background(), nil)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	var names []string
+	for _, tl := range res.Tools {
+		names = append(names, tl.Name)
+	}
+	sort.Strings(names)
+	return names
 }

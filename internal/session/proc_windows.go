@@ -22,3 +22,10 @@ func killTree(p *os.Process) error {
 	}
 	return nil
 }
+
+func exitStatus(ps *os.ProcessState, err error) (int, string) {
+	if ps == nil {
+		return -1, ""
+	}
+	return ps.ExitCode(), ""
+}

@@ -6,6 +6,7 @@ import "fmt"
 const (
 	CodeInvalidArgument = "invalid_argument"
 	CodeNotFound        = "not_found"
+	CodeSessionClosed   = "session_closed"
 	CodeLimitReached    = "limit_reached"
 	CodeSpawnFailed     = "spawn_failed"
 	CodeNotAllowed      = "not_allowed"

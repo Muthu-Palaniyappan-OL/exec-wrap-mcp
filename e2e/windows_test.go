@@ -21,7 +21,7 @@ func TestCmdStatePersists(t *testing.T) {
 
 func TestPipeMode(t *testing.T) {
 	c := newClient(t)
-	out := c.mustCall("launch", map[string]any{"command": "cmd.exe", "tty": false})
+	out := c.mustCall("launch", map[string]any{"command": "cmd.exe", "pipe": true})
 	id := out["session_id"].(string)
 	r := c.mustCall("send", map[string]any{"session_id": id, "input": "echo hello"})
 	if !strings.Contains(r["output"].(string), "hello") {

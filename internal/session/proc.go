@@ -15,7 +15,7 @@ import (
 type process interface {
 	io.Writer
 	Read(p []byte) (int, error)
-	Wait() (int, error)
+	Wait() (code int, signal string)
 	PID() int
 	Mode() string
 	Resize(rows, cols int) error
@@ -104,9 +104,9 @@ func (p *ptyProc) Suspend() error {
 func (p *ptyProc) Terminate() error { return terminateTree(p.cmd.Process) }
 func (p *ptyProc) Kill() error      { return killTree(p.cmd.Process) }
 func (p *ptyProc) Close() error     { return p.p.Close() }
-func (p *ptyProc) Wait() (int, error) {
+func (p *ptyProc) Wait() (int, string) {
 	err := p.cmd.Wait()
-	return exitCode(p.cmd.ProcessState, err), nil
+	return exitStatus(p.cmd.ProcessState, err)
 }
 
 func (p *ptyProc) Drain() {
@@ -163,19 +163,9 @@ func (p *pipeProc) Close() error {
 	_ = p.stdin.Close()
 	return p.out.Close()
 }
-func (p *pipeProc) Wait() (int, error) {
+func (p *pipeProc) Wait() (int, string) {
 	err := p.cmd.Wait()
-	return exitCode(p.cmd.ProcessState, err), nil
-}
-
-func exitCode(ps *os.ProcessState, err error) int {
-	if ps != nil {
-		return ps.ExitCode()
-	}
-	if err != nil {
-		return -1
-	}
-	return 0
+	return exitStatus(p.cmd.ProcessState, err)
 }
 
 // mergeEnv overlays overrides on base, de-duplicating keys (case-insensitive

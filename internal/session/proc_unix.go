@@ -5,6 +5,7 @@ package session
 import (
 	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 )
 
@@ -30,3 +31,25 @@ func terminateTree(p *os.Process) error {
 }
 
 func killTree(p *os.Process) error { return signalTree(p, syscall.SIGKILL) }
+
+var sigNames = map[syscall.Signal]string{
+	syscall.SIGHUP: "SIGHUP", syscall.SIGINT: "SIGINT", syscall.SIGQUIT: "SIGQUIT",
+	syscall.SIGABRT: "SIGABRT", syscall.SIGKILL: "SIGKILL", syscall.SIGSEGV: "SIGSEGV",
+	syscall.SIGPIPE: "SIGPIPE", syscall.SIGTERM: "SIGTERM", syscall.SIGBUS: "SIGBUS",
+}
+
+// exitStatus returns the exit code, using the shell convention 128+N and the
+// signal name when the process was killed by a signal.
+func exitStatus(ps *os.ProcessState, err error) (int, string) {
+	if ps == nil {
+		return -1, ""
+	}
+	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		name := sigNames[ws.Signal()]
+		if name == "" {
+			name = "signal " + strconv.Itoa(int(ws.Signal()))
+		}
+		return 128 + int(ws.Signal()), name
+	}
+	return ps.ExitCode(), ""
+}

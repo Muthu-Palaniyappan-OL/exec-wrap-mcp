@@ -34,11 +34,13 @@ func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 func main() {
 	cfg := session.DefaultConfig()
 	var allow multiFlag
-	var showVersion, logIO bool
+	var showVersion, logIO, structured bool
 	flag.IntVar(&cfg.MaxSessions, "max-sessions", cfg.MaxSessions, "maximum number of concurrent sessions")
 	flag.DurationVar(&cfg.IdleTTL, "idle-ttl", cfg.IdleTTL, "kill sessions unused for this long (0 disables)")
 	flag.IntVar(&cfg.MaxBuffer, "max-buffer", cfg.MaxBuffer, "unread output bytes retained per session")
 	flag.Var(&allow, "allow-command", "glob of permitted executables (repeatable; default: allow all)")
+	flag.IntVar(&cfg.MaxOutput, "max-output", cfg.MaxOutput, "maximum bytes returned per call (head 25% + tail 75% kept)")
+	flag.BoolVar(&structured, "structured", false, "also return machine-readable structuredContent (larger responses)")
 	flag.BoolVar(&cfg.CleanEnv, "clean-env", false, "pass only a minimal environment (PATH, HOME, USER, LANG, TERM) to children")
 	flag.BoolVar(&logIO, "log-io", false, "log session input/output to stderr (may expose secrets)")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
@@ -65,7 +67,7 @@ func main() {
 
 	m := session.NewManager(cfg)
 	defer m.Close()
-	s := server.New(m, server.Options{Version: version, LogIO: logIO, Logger: logger})
+	s := server.New(m, server.Options{Version: version, LogIO: logIO, Logger: logger, Structured: structured})
 
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx, &mcp.StdioTransport{}) }()

@@ -1,102 +1,66 @@
-# exec-wrap-mcp: Spec (v0.1)
+# exec-wrap-mcp: Spec (v0.1.1)
 
-An MCP server (stdio only) that wraps long-lived interactive programs (bash, gdb, python, psql, ...) as persistent **sessions**. State survives across tool calls (`export ONE=1` then `echo $ONE` prints `1`). Many sessions can run at once.
+An MCP server (stdio only) that wraps long-lived interactive programs (bash, gdb, lldb, python, psql, ...) as persistent **sessions**. State survives across tool calls (`export ONE=1` then `echo $ONE` prints `1`). Many sessions run at once.
 
 ## 1. Stack and constraints
-- Go 1.25+, one static binary (`CGO_ENABLED=0`). Transport is stdio only; stdout carries MCP frames only, logs go to stderr.
-- MCP: official SDK `github.com/modelcontextprotocol/go-sdk` (typed `mcp.AddTool`, so input/output JSON Schemas derive from Go structs). It is maintained with Google, so no alternative is needed.
-- Unix PTY: `github.com/creack/pty`. Windows: ConPTY (`github.com/aymanbagabas/go-pty`). If ConPTY is unavailable (Windows < 1809 or the call fails), fall back to pipes with `tty:false`. Sessions can also request `tty:false` on any OS.
-- Process cleanup: unix uses `setsid` and kills the process group. Windows uses a Job Object with `KILL_ON_JOB_CLOSE`. All sessions die when the server exits (stdin EOF, SIGINT, SIGTERM).
+- Go 1.25+, one static binary (`CGO_ENABLED=0`). Stdio transport only; stdout carries MCP frames, logs go to stderr.
+- MCP: `github.com/modelcontextprotocol/go-sdk`. Unix PTY and Windows ConPTY via `github.com/aymanbagabas/go-pty`; `pipe` mode (plain pipes) on any OS and as ConPTY fallback.
+- Cleanup: each child leads its own process group (setsid/setpgid); signals reach the whole job. Windows uses `taskkill /T`. All sessions die when the server exits.
 
-## 2. Session model
-- ID: `s_` + 8 random hex chars. State: `running | exited`. An exited session keeps its exit code and unread output until `kill` or TTL.
-- Each session has a reader goroutine feeding a ring buffer (4 MiB cap, oldest bytes dropped, `dropped_bytes` counted) plus a read cursor for "unread" output.
-- Per-session mutex: a second `send`/`read` while one is waiting returns `busy`. Different sessions are fully concurrent.
-- Limits (flags/env): `--max-sessions 16`, `--idle-ttl 30m` (reaped after no tool call; reaper sweeps every 30s), `--max-buffer 4194304`.
+## 2. Token budget (design rule)
+Every byte of schema and result is paid for in LLM tokens, so:
+- **4 tools**: `launch`, `send`, `kill`, `list`. Hand-written minimal input schemas (about 2.2 KB for all four, down from 8.4 KB for 7 tools in v0.1.0). A test enforces a 3000-byte budget.
+- **Text-only results by default**: the program's output, plus a one-line `[note]` only when something is unusual. No JSON duplicate, no output schema. `--structured` adds `structuredContent` for programmatic clients.
+- Empty successful reply is `ok`.
+- Fewer calls: `launch` takes `input`, so "start Python and run X" is one call. Sessions expire on their own, so `kill` is optional.
 
 ## 3. Tools
-All tools return structured output plus a text rendering of the same data. Durations are in ms.
+Arguments are flat; zero/empty means "default".
 
 ### `launch`
-In: `command` (string, required, e.g. `/bin/bash`), `args` ([]string), `cwd`, `env` (map, merged over the inherited env), `preset` (`bash|zsh|sh|python|gdb|psql|node|cmd|powershell|none`, default: inferred from the basename), `prompt_regex` (overrides the preset), `tty` (bool, default true), `rows`/`cols` (default 40x200), `startup_wait_ms` (default 1000; waits for the first prompt/idle and returns the banner).
-Out: `session_id`, `pid`, `output`, `done_reason`, `tty_mode` (`pty|conpty|pipe`), `prompt_regex` (effective).
-No shell is involved: `command` + `args` are exec'd directly.
+`command` (required), `args`, `cwd`, `env`, `input` (first input, sent once ready), `wait_ms` (readiness + first reply, default 30000), `preset`, `prompt_regex`, `ready_regex` (startup-finished pattern for prompt-less programs), `pipe` (no terminal), `rows`, `cols` (default 40x200).
+Reply: first line is the session id, then the output. `[starting: ...]` if the program is not ready within `wait_ms`.
+`command` + `args` are exec'd directly; no shell is involved.
 
 ### `send`
-In: `session_id`, `input` (string), `newline` (bool, default true: appends `\n`; Windows ConPTY uses `\r`), `wait`: `{ idle_ms (300), timeout_ms (30000, max 600000), prompt_regex?, until_regex? }`, `strip_ansi` (default true), `max_bytes`, `no_wait` (bool: write and return immediately).
-Out: `output`, `done_reason` (`prompt|idle|until|timeout|exited`), `exited` (bool), `exit_code?`, `truncated`, `dropped_bytes`, `elapsed_ms`.
-Writes input, flushes, waits per section 4, returns new output only. The echoed input line is stripped on a best-effort basis.
-
-### `read`
-In: `session_id`, `wait` (same object as `send`, default `idle_ms:300, timeout_ms:0` meaning return pending now), `strip_ansi`, `max_bytes`. Out: same as `send`.
-Use it after a `timeout`, or for background output.
-
-### `signal`
-In: `session_id`, `signal` (`interrupt|terminate|kill|eof|suspend`; default `interrupt`). Out: `ok`, plus the same output fields after a short idle wait.
-`interrupt` writes `0x03` to the PTY (so the foreground job gets SIGINT; on Windows ConPTY uses Ctrl-C input, on pipes `CTRL_BREAK_EVENT`). `eof` writes `0x04`. `suspend` is unix-only.
-
-### `resize`
-In: `session_id`, `rows`, `cols`. Out: `ok`. Returns `unsupported` for pipe mode.
-
-### `list`
-In: none. Out: `sessions[]` of `{session_id, command, args, pid, state, exit_code?, age_s, idle_s, unread_bytes, tty_mode}`.
+`session_id` (required), `input`, `key` (`ctrl-c|ctrl-d|ctrl-z|term|kill`; exclusive with `input`), `raw` (no newline appended), `wait_ms` (default 30000, max 600000), `idle_ms`, `until` (regex), `no_wait`.
+- With `input`: writes it, flushes, waits per section 5, returns the new output.
+- With neither `input` nor `key`: reads more output (use after a timeout). `no_wait` returns what is pending now.
+- With `key`: delivers the key or signal and returns the resulting output.
 
 ### `kill`
-In: `session_id`, `grace_ms` (default 2000). Out: `exit_code`, `final_output`, `forced` (bool).
-Sends terminate, waits `grace_ms`, then kills the process tree. It removes the session. Killing an unknown ID returns `not_found`.
+`session_id`. Terminates gracefully (SIGHUP+SIGTERM, 2 s), then force-kills; removes the session. Reply is `ok` or any final output.
 
-## 4. Knowing when output is "done" (the key problem)
-An interactive process never signals "done", so `send` ends on the first condition met:
-1. **exited**: the process ended. Return the remaining output and the exit code.
-2. **until**: `until_regex` (per call) matches new output.
-3. **prompt**: `prompt_regex` (per call, else the session's) matches the tail of the output (the last line, or a partial line, since prompts lack `\n`) after ANSI stripping. Presets:
-   - bash/zsh/sh: launch exports a unique `PS1` of the form `\x1e<sid>\x1e$ ` (and `PROMPT_COMMAND` capturing `$?`) so the match cannot collide with program output. The server strips the marker and reports `last_exit_status` in the response.
-   - python: `(?m)^(>>> |\.\.\. )$`. gdb: `\(gdb\) $`. psql: `\S+[=#>(\-]+ $`. node: `^> $`. cmd/powershell: `^(PS )?[A-Z]:\\.*> $`.
-4. **idle**: no new bytes for `idle_ms`. This is the fallback when there is no prompt (default 300ms; the clock restarts on every byte, so a slow but steady stream keeps waiting).
-5. **timeout**: `timeout_ms` reached. The process keeps running and `done_reason:"timeout"` tells the model to call `read` or `signal interrupt`.
+### `list`
+No arguments. One line per session: `id command state` where state is `starting`, `running` or `exited N`.
 
-Rule of thumb: with a prompt regex, `idle` is only a safety net. Idle must not fire before the first byte after a send until `min(idle_ms, 50ms)` has passed, and the wait starts after the write is flushed, so stale output is never mistaken for the response.
+### Notes appended to replies
+`[exit N]` (last shell command failed), `[exited N]`, `[killed by SIGKILL]`, `[timeout: still running; ...]`, `[idle: no prompt seen ...]`, `[starting: ...]`, `[truncated]`, `[dropped NB]`.
 
-Output handling: normalize `\r\n` to `\n`; with `strip_ansi` remove CSI/OSC sequences (the raw bytes are never altered in the buffer); invalid UTF-8 becomes U+FFFD.
+## 4. Session model and lifecycle
+- ID `s_` + 8 hex chars. States: `starting` (until the first prompt/ready pattern), `running`, `exited` (keeps exit code and unread output).
+- **Startup readiness.** A session with a known prompt or `ready_regex` starts as `starting`. The reader goroutine detects the pattern as bytes arrive. `launch` waits up to `wait_ms`. If the program is still loading, `launch` returns `[starting]`, and the process keeps running. A later `send` waits for readiness first (within its own `wait_ms`), then writes; if it is not ready in time, nothing is written (`[starting]`). After one timed-out wait, a program that has produced output and then stays silent for 3 s counts as ready, so a wrong prompt pattern cannot wedge a session. Shell setup noise and banners printed before readiness are discarded (banners of non-shell programs are returned with the first reply).
+- **Limits.** `--max-sessions 16`, `--idle-ttl 30m` (no tool call; sessions in the middle of a call are never reaped), `--max-buffer 4 MiB` per session (oldest dropped, counted), `--max-output 65536` per reply.
+- **Dead sessions.** A process that exits (or is killed by a signal) leaves an `exited` session: `send` returns `session_exited: ... (code N)` with leftover output; `send` with no input still returns the leftover output plus `[exited N]`. Signal deaths report the shell convention `128+N` and the signal name. Exited sessions are evicted (oldest first) only when a new `launch` needs the slot.
+- **Tombstones.** The last 64 removed ids are remembered. `send`/`kill` on them returns `session_closed: session s_x was ended by kill | was closed after 30m0s without use | had exited (code N) and was cleaned up`, each saying state is lost and to launch again. Only ids never seen return `not_found`.
+- A second call into a busy session returns `busy`. Different sessions are fully concurrent.
 
-## 5. Output truncation
-- Per response cap: `max_bytes` (default 64 KiB, hard max 1 MiB). When exceeded, keep the **head 25% + tail 75%** with a `[... N bytes omitted ...]` marker, set `truncated:true`. The omitted middle is not re-readable. Tell the model to use `| head`/`| tail` or a pager-free command.
-- The ring buffer overflow (4 MiB unread) drops the oldest bytes and reports `dropped_bytes`.
-- Programs that page (git, less, man) are mitigated by setting `PAGER=cat`, `TERM=dumb` unless `env` overrides.
+## 5. Knowing when output is "done"
+`send` returns on the first of: **exited**, **until** (`until` regex matched), **prompt** (prompt regex matches the cleaned tail, after at least one new byte and 25 ms of quiet so multi-command input is not cut short), **idle** (no new bytes for `idle_ms`; 300 ms default, 5 s when a prompt is known), **timeout** (`wait_ms`; the process keeps running).
+Presets: bash/sh/zsh (private marker prompt: an ASCII record separator around the last exit status, installed at launch; bash and zsh run without line editing and with echo off; the marker is stripped and reported as `[exit N]`), python, gdb, lldb, psql, node, cmd, powershell, none.
+Output is normalised: `\r\n` to `\n`, ANSI/OSC sequences removed, `\r` and `\b` applied like a dumb terminal, invalid UTF-8 replaced. Replies over `--max-output` keep head 25% and tail 75% with a marker. Children get `TERM=dumb`, `PAGER=cat` unless `env` overrides.
 
 ## 6. Security
-This server is **arbitrary code execution as the invoking user**. It adds no sandbox.
-- No network listener, no HTTP transport, no file-based IPC. The only channel is the parent's stdio.
-- Optional policy: `--allow-command <glob>` (repeatable; when set, `launch` must match the resolved absolute path). The default is allow-all, documented loudly in the README.
-- `launch` takes `command` + `args`, never a shell string, so there is no injection in our layer (the user can still launch `/bin/bash`).
-- Environment is inherited by default; `--clean-env` passes only `PATH,HOME,USER,LANG,TERM`.
-- Logs on stderr never include input or output content unless `--log-io` is set. Sessions are not persisted to disk and are not shared across server instances.
-- Human approval of tool calls is the MCP client's job. The README tells users to enable it.
-- Resource bounds: session count, buffer size, max wait, and TTL reaping prevent runaway growth.
+Arbitrary code execution as the invoking user; no sandbox. Stdio only, no listener. `launch` takes `command` + `args`, never a shell string. `--allow-command <glob>` (repeatable) restricts executables. `--clean-env` passes only `PATH,HOME,USER,LANG,TERM`. I/O is logged only with `--log-io`.
 
-## 7. Error handling
-Tool failures set `isError:true` with `{code, message}`; protocol errors are reserved for malformed requests.
-Codes: `invalid_argument`, `not_found`, `limit_reached`, `spawn_failed`, `not_allowed`, `busy`, `session_exited` (write to a dead process; includes exit code and any remaining output), `unsupported`, `internal`.
-A crashed process is never an error for `read`/`send`: it returns `exited:true`. Panics in a session goroutine are recovered and logged; they must not take down other sessions.
+## 7. Errors
+Tool errors set `isError` with text `code: message`. Codes: `invalid_argument`, `not_found`, `session_closed`, `limit_reached`, `spawn_failed`, `not_allowed`, `busy`, `session_exited`, `unsupported`, `internal`.
 
-## 8. Testing plan
-- **Unit**: ring buffer (wrap, drop count, cursor), ANSI stripper, head/tail truncation, wait state machine against a fake byte source with a fake clock (each `done_reason`, idle restarts, prompt split across reads), echo stripping, policy globbing, ID generation.
-- **Integration** (build the binary, drive it with the SDK's client over `CommandTransport`):
-  - bash: `export ONE=1` then `echo $ONE` returns `1`; `cd` persists; exit status reported.
-  - two concurrent bash sessions have isolated state; parallel `send` calls on different sessions; `busy` on the same session.
-  - `sleep 5` with `timeout_ms:500` returns `timeout`, then `read` collects the rest; `signal interrupt` stops `sleep 100`.
-  - python REPL multi-line block; `prompt_regex` override; `until_regex`; large output (`seq 1 200000`) is truncated with the marker.
-  - `kill` (graceful and forced), `exit` inside a session, TTL reaping (short TTL via flag), `--max-sessions`, server stdin close leaves no orphan processes (check pids).
-  - Windows: `cmd.exe` and `powershell` over ConPTY, plus `tty:false` pipe mode; skip unix-only cases with build tags.
-- CI runs `go test -race ./...`, `go vet`, `golangci-lint`, on ubuntu, macos (arm64) and windows. Tests have 60s timeouts to avoid hanging CI.
+## 8. Testing
+Unit tests: output cleaning, truncation, presets/prompt regexes, echo stripping, env merge. End-to-end tests build the binary and drive it with the SDK client (Linux every change; macOS and Windows on demand): state persistence, isolation, multi-line input, timeout then read, Ctrl-C, truncation, exit/kill, reaping (and not reaping a busy session), allow-list and limits, Python and lldb sessions, slow-starting Python and bash, signal deaths, eviction, text-mode output and the schema size budget.
 
 ## 9. Release and maintenance
-- SemVer, tags `vX.Y.Z`; `v0.x` until the tool schemas are stable. A schema-breaking change means a major bump (after 1.0). `--version` is injected via ldflags.
-- `.github/workflows/ci.yml`: on push and PR, the test matrix above plus `goreleaser check`.
-- `.github/workflows/release.yml`: on tag `v*`, run goreleaser: linux/darwin/windows x amd64/arm64, `CGO_ENABLED=0`, `-trimpath`, tar.gz (zip on Windows), `checksums.txt`, changelog from conventional commits.
-- Install: `go install github.com/Muthu-Palaniyappan-OL/exec-wrap-mcp@latest`; release archives (a Homebrew tap is a possible follow-up). The README includes client config snippets (`{"command":"exec-wrap-mcp"}`).
-- `.github/dependabot.yml`: ecosystems `gomod` and `github-actions`, weekly, grouped minor+patch.
-- `.github/workflows/dependabot-automerge.yml`: on PRs by `dependabot[bot]`, use `dependabot/fetch-metadata`; for semver patch/minor run `gh pr merge --auto --squash`. Major updates get a label and need manual review. Auto-merge only completes after the required CI checks pass (branch protection requires the 3-OS matrix; repo setting "Allow auto-merge" enabled; workflow permissions `contents: write, pull-requests: write`).
+SemVer, tags `vX.Y.Z`, GoReleaser (linux/darwin/windows x amd64/arm64) on tag. CI: one Linux job (`ci-ok`). Dependabot opens PRs for Go modules and Actions and auto-merges them once `ci-ok` passes; a 6-hourly sweep re-enables auto-merge on any that missed it.
 
-## 10. Out of scope (v0.1)
-Remote/HTTP transport, authentication, session persistence across server restarts, screen-scraping of full-screen TUIs (vim, htop), file transfer.
+## 10. Out of scope
+Remote/HTTP transport, authentication, persistence across server restarts, full-screen TUIs (vim, htop), file transfer.

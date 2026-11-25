@@ -80,11 +80,11 @@ func TestMultiLineInput(t *testing.T) {
 func TestTimeoutThenRead(t *testing.T) {
 	c := newClient(t)
 	id := launchBash(t, c)
-	out := send(t, c, id, "sleep 1; echo done-sleeping", map[string]any{"wait": map[string]any{"timeout_ms": 300}})
+	out := send(t, c, id, "sleep 1; echo done-sleeping", map[string]any{"wait_ms": 300})
 	if out["done_reason"] != "timeout" {
 		t.Fatalf("done_reason = %v", out["done_reason"])
 	}
-	out = c.mustCall("read", map[string]any{"session_id": id, "wait": map[string]any{"timeout_ms": 5000}})
+	out = c.mustCall("send", map[string]any{"session_id": id, "wait_ms": 5000})
 	if out["output"] != "done-sleeping" || out["done_reason"] != "prompt" {
 		t.Fatalf("read = %v", out)
 	}
@@ -93,11 +93,11 @@ func TestTimeoutThenRead(t *testing.T) {
 func TestInterrupt(t *testing.T) {
 	c := newClient(t)
 	id := launchBash(t, c)
-	out := send(t, c, id, "sleep 100", map[string]any{"wait": map[string]any{"timeout_ms": 300}})
+	out := send(t, c, id, "sleep 100", map[string]any{"wait_ms": 300})
 	if out["done_reason"] != "timeout" {
 		t.Fatalf("done_reason = %v", out["done_reason"])
 	}
-	out = c.mustCall("signal", map[string]any{"session_id": id})
+	out = c.mustCall("send", map[string]any{"session_id": id, "key": "ctrl-c"})
 	if out["done_reason"] != "prompt" {
 		t.Fatalf("after interrupt: %v", out)
 	}
@@ -107,9 +107,9 @@ func TestInterrupt(t *testing.T) {
 }
 
 func TestLargeOutputTruncated(t *testing.T) {
-	c := newClient(t)
+	c := newClient(t, "--max-output", "2000")
 	id := launchBash(t, c)
-	out := send(t, c, id, "seq 1 200000", map[string]any{"max_bytes": 2000})
+	out := send(t, c, id, "seq 1 200000", nil)
 	s := out["output"].(string)
 	if out["truncated"] != true || !strings.Contains(s, "bytes omitted") || !strings.HasSuffix(s, "200000") || !strings.HasPrefix(s, "1\n") {
 		t.Fatalf("truncated=%v len=%d head=%q", out["truncated"], len(s), s[:20])
@@ -132,7 +132,7 @@ func TestExitAndKill(t *testing.T) {
 		t.Fatalf("kill: %v", k)
 	}
 	_, text, isErr = c.call("kill", map[string]any{"session_id": id})
-	if !isErr || !strings.Contains(text, "not_found") {
+	if !isErr || !strings.Contains(text, "session_closed") || !strings.Contains(text, "kill") {
 		t.Fatalf("second kill: %v %q", isErr, text)
 	}
 }
@@ -161,7 +161,7 @@ func TestPythonREPL(t *testing.T) {
 
 func TestNoPromptFallsBackToIdle(t *testing.T) {
 	c := newClient(t)
-	out := c.mustCall("launch", map[string]any{"command": "cat", "tty": false})
+	out := c.mustCall("launch", map[string]any{"command": "cat", "pipe": true})
 	id := out["session_id"].(string)
 	r := send(t, c, id, "hello", nil)
 	if r["output"] != "hello" || r["done_reason"] != "idle" {
@@ -172,7 +172,7 @@ func TestNoPromptFallsBackToIdle(t *testing.T) {
 func TestUntilRegex(t *testing.T) {
 	c := newClient(t)
 	id := launchBash(t, c)
-	out := send(t, c, id, "echo start; sleep 1; echo READY; sleep 2", map[string]any{"wait": map[string]any{"until_regex": "READY"}})
+	out := send(t, c, id, "echo start; sleep 1; echo READY; sleep 2", map[string]any{"until": "READY"})
 	if out["done_reason"] != "until" || !strings.Contains(out["output"].(string), "READY") {
 		t.Fatalf("got %v", out)
 	}
@@ -196,7 +196,7 @@ func TestIdleReaping(t *testing.T) {
 	id := launchBash(t, c)
 	time.Sleep(1500 * time.Millisecond)
 	_, text, isErr := c.call("send", map[string]any{"session_id": id, "input": "echo hi"})
-	if !isErr || !strings.Contains(text, "not_found") {
+	if !isErr || !strings.Contains(text, "session_closed") || !strings.Contains(text, "without use") {
 		t.Fatalf("expected reaped session: %v %q", isErr, text)
 	}
 }
@@ -208,7 +208,7 @@ func TestBadArguments(t *testing.T) {
 		t.Fatalf("spawn: %v %q", isErr, text)
 	}
 	id := launchBash(t, c)
-	_, text, isErr = c.call("send", map[string]any{"session_id": id, "input": "x", "wait": map[string]any{"until_regex": "("}})
+	_, text, isErr = c.call("send", map[string]any{"session_id": id, "input": "x", "until": "("})
 	if !isErr || !strings.Contains(text, "invalid_argument") {
 		t.Fatalf("regex: %v %q", isErr, text)
 	}

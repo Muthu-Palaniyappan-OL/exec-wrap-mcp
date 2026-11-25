@@ -11,19 +11,21 @@ import (
 
 // Done reasons reported by wait operations.
 const (
-	ReasonPrompt  = "prompt"
-	ReasonIdle    = "idle"
-	ReasonUntil   = "until"
-	ReasonTimeout = "timeout"
-	ReasonExited  = "exited"
-	ReasonPending = "pending" // read with no waiting
-	ReasonNoWait  = "no_wait"
+	ReasonPrompt   = "prompt"
+	ReasonIdle     = "idle"
+	ReasonUntil    = "until"
+	ReasonTimeout  = "timeout"
+	ReasonExited   = "exited"
+	ReasonPending  = "pending" // read with no waiting
+	ReasonNoWait   = "no_wait"
+	ReasonStarting = "starting" // the program has not reached its first prompt yet
 )
 
 const (
 	promptQuiet       = 25 * time.Millisecond // quiet time required after a prompt match
 	defaultIdle       = 300 * time.Millisecond
 	defaultPromptIdle = 5 * time.Second // safety net when a prompt is known
+	startIdleFallback = 3 * time.Second // quiet period after which a started-but-unrecognised program counts as ready
 	tailBytes         = 8192
 )
 
@@ -47,6 +49,7 @@ type Result struct {
 	Reason         string
 	Exited         bool
 	ExitCode       *int
+	ExitSignal     string
 	LastExitStatus *int
 	Truncated      bool
 	DroppedBytes   int
@@ -61,8 +64,9 @@ type Info struct {
 	PID         int
 	Mode        string
 	Preset      string
-	State       string
+	State       string // starting, running or exited
 	ExitCode    *int
+	ExitSignal  string
 	Age         time.Duration
 	Idle        time.Duration
 	UnreadBytes int
@@ -75,39 +79,57 @@ type Session struct {
 	Args    []string
 	Preset  string
 
-	proc    process
-	prompt  *regexp.Regexp
-	marker  bool
-	tty     bool
-	created time.Time
-	maxBuf  int
+	proc     process
+	prompt   *regexp.Regexp
+	readyRe  *regexp.Regexp // non-nil while the program may still be loading
+	initText string         // shell setup line, scrubbed from output
+	marker   bool
+	tty      bool
+	created  time.Time
+	maxBuf   int
 
 	opMu sync.Mutex // serialises send/read/signal; TryLock => "busy"
 
-	mu       sync.Mutex
-	buf      []byte
-	dropped  int
-	total    uint64
-	lastByte time.Time
-	lastUsed time.Time
-	exited   bool
-	exitCode int
-	notify   chan struct{}
+	mu          sync.Mutex
+	buf         []byte
+	dropped     int
+	total       uint64
+	lastByte    time.Time
+	lastUsed    time.Time
+	starting    bool
+	startWaited bool
+	preamble    string // banner captured before the first prompt
+	exited      bool
+	exitCode    int
+	exitSig     string
+	notify      chan struct{}
 
 	readDone chan struct{}
 	waitDone chan struct{}
 }
 
-func newSession(id string, sp startSpec, command string, args []string, preset string, prompt *regexp.Regexp, marker bool, maxBuf int) (*Session, error) {
+type sessionSpec struct {
+	id, command string
+	args        []string
+	preset      string
+	prompt      *regexp.Regexp
+	ready       *regexp.Regexp
+	initText    string
+	marker      bool
+	maxBuf      int
+}
+
+func newSession(sp startSpec, ss sessionSpec) (*Session, error) {
 	p, err := startProcess(sp)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
 	s := &Session{
-		ID: id, Command: command, Args: args, Preset: preset,
-		proc: p, prompt: prompt, marker: marker, tty: p.Mode() != "pipe",
-		created: now, lastUsed: now, maxBuf: maxBuf,
+		ID: ss.id, Command: ss.command, Args: ss.args, Preset: ss.preset,
+		proc: p, prompt: ss.prompt, readyRe: ss.ready, initText: ss.initText,
+		marker: ss.marker, tty: p.Mode() != "pipe",
+		created: now, lastUsed: now, maxBuf: ss.maxBuf, starting: ss.ready != nil,
 		notify:   make(chan struct{}, 1),
 		readDone: make(chan struct{}),
 		waitDone: make(chan struct{}),
@@ -138,6 +160,9 @@ func (s *Session) readLoop() {
 			}
 			s.total += uint64(n)
 			s.lastByte = time.Now()
+			if s.starting {
+				s.checkReadyLocked()
+			}
 			s.mu.Unlock()
 			s.poke()
 		}
@@ -147,9 +172,38 @@ func (s *Session) readLoop() {
 	}
 }
 
+// checkReadyLocked ends the starting state when the ready/prompt pattern
+// shows up at the end of the output. The caller holds s.mu.
+func (s *Session) checkReadyLocked() {
+	from := 0
+	if n := len(s.buf); n > tailBytes {
+		from = n - tailBytes
+	}
+	if s.readyRe.MatchString(Clean(s.buf[from:], true)) {
+		s.finishStartLocked()
+	}
+}
+
+// finishStartLocked leaves the starting state and keeps any banner as the
+// preamble of the next result. Shell setup noise is discarded.
+func (s *Session) finishStartLocked() {
+	s.starting = false
+	text := Clean(s.buf, true)
+	if s.marker {
+		text = ""
+	} else if loc := s.readyRe.FindStringIndex(text); loc != nil && loc[1] == len(text) {
+		text = text[:loc[0]]
+	}
+	if s.initText != "" {
+		text = strings.ReplaceAll(text, s.initText, "")
+	}
+	s.preamble = strings.TrimSpace(text)
+	s.buf, s.dropped = nil, 0
+}
+
 func (s *Session) waitLoop() {
 	defer close(s.waitDone)
-	code, _ := s.proc.Wait()
+	code, sig := s.proc.Wait()
 	s.proc.Drain()
 	select {
 	case <-s.readDone:
@@ -161,7 +215,7 @@ func (s *Session) waitLoop() {
 	case <-time.After(200 * time.Millisecond):
 	}
 	s.mu.Lock()
-	s.exited, s.exitCode = true, code
+	s.exited, s.exitCode, s.exitSig = true, code, sig
 	s.mu.Unlock()
 	s.poke()
 }
@@ -181,10 +235,14 @@ func (s *Session) Info() Info {
 		Preset: s.Preset, State: "running", Age: time.Since(s.created),
 		Idle: time.Since(s.lastUsed), UnreadBytes: len(s.buf),
 	}
+	if s.starting {
+		in.State = "starting"
+	}
 	if s.exited {
 		in.State = "exited"
 		c := s.exitCode
 		in.ExitCode = &c
+		in.ExitSignal = s.exitSig
 	}
 	return in
 }
@@ -210,6 +268,14 @@ func (s *Session) Exited() bool {
 	return s.exited
 }
 
+func (s *Session) isBusy() bool {
+	if !s.opMu.TryLock() {
+		return true
+	}
+	s.opMu.Unlock()
+	return false
+}
+
 func (s *Session) lock() error {
 	if !s.opMu.TryLock() {
 		return Errorf(CodeBusy, "session %s is busy with another call", s.ID)
@@ -221,6 +287,88 @@ func (s *Session) snapshotTotal() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.total
+}
+
+// waitReady blocks while the session is starting. It returns ReasonPrompt
+// when the program is ready, ReasonExited if it died, or ReasonStarting when
+// the timeout elapsed first. After one timed-out attempt, a quiet program is
+// also treated as ready so a wrong prompt pattern cannot wedge the session.
+func (s *Session) waitReady(ctx context.Context, timeout time.Duration) string {
+	s.mu.Lock()
+	fallback := s.startWaited
+	s.mu.Unlock()
+	start := time.Now()
+	deadline := start.Add(timeout)
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	for {
+		s.mu.Lock()
+		if !s.starting {
+			s.mu.Unlock()
+			return ReasonPrompt
+		}
+		if s.exited {
+			s.mu.Unlock()
+			return ReasonExited
+		}
+		last := s.lastByte
+		if last.Before(start) {
+			last = start
+		}
+		now := time.Now()
+		// Only a program that already printed something (so it is alive and
+		// its prompt pattern is probably wrong) may be declared ready by silence.
+		fallback := fallback && s.total > 0
+		if fallback && !now.Before(last.Add(startIdleFallback)) {
+			s.finishStartLocked()
+			s.mu.Unlock()
+			return ReasonPrompt
+		}
+		if !now.Before(deadline) {
+			s.startWaited = true
+			s.mu.Unlock()
+			return ReasonStarting
+		}
+		wake := deadline
+		if fallback && last.Add(startIdleFallback).Before(wake) {
+			wake = last.Add(startIdleFallback)
+		}
+		s.mu.Unlock()
+		timer.Reset(time.Until(wake))
+		select {
+		case <-s.notify:
+		case <-timer.C:
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.startWaited = true
+			s.mu.Unlock()
+			return ReasonStarting
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+}
+
+// ensureReady waits for startup to finish. When it returns false the Result
+// explains why the caller should stop (still starting, or exited).
+func (s *Session) ensureReady(ctx context.Context, timeout time.Duration, oo OutputOpts, started time.Time) (Result, bool) {
+	s.mu.Lock()
+	starting := s.starting
+	s.mu.Unlock()
+	if !starting {
+		return Result{}, true
+	}
+	switch s.waitReady(ctx, timeout) {
+	case ReasonPrompt:
+		return Result{}, true
+	case ReasonExited:
+		return s.result(ReasonExited, "", nil, oo, started), false
+	}
+	return s.result(ReasonStarting, "", nil, oo, started), false
 }
 
 // await blocks until a completion condition holds and returns the reason.
@@ -268,10 +416,7 @@ func (s *Session) await(ctx context.Context, o WaitOpts, startTotal uint64) stri
 		if last.Before(start) {
 			last = start
 		}
-		wake := start.Add(idle)
-		if t := last.Add(idle); t.After(wake) {
-			wake = t
-		}
+		wake := last.Add(idle)
 		if fresh && o.Until != nil && o.Until.MatchString(Clean(all, true)) {
 			return ReasonUntil
 		}
@@ -323,6 +468,9 @@ func (s *Session) result(reason, input string, prompt *regexp.Regexp, oo OutputO
 	raw, dropped := s.take()
 	text := Clean(raw, oo.StripANSI)
 	r := Result{Reason: reason, DroppedBytes: dropped, Elapsed: time.Since(started)}
+	if s.initText != "" {
+		text = strings.ReplaceAll(text, s.initText, "")
+	}
 	if s.marker {
 		if ms := markerRe.FindAllStringSubmatch(text, -1); len(ms) > 0 {
 			if n, err := strconv.Atoi(ms[len(ms)-1][1]); err == nil {
@@ -340,14 +488,23 @@ func (s *Session) result(reason, input string, prompt *regexp.Regexp, oo OutputO
 		text = stripEcho(text, input)
 	}
 	text = strings.TrimRight(text, "\n")
-	r.Output, r.Truncated = Truncate(text, oo.MaxBytes)
 	s.mu.Lock()
+	if s.preamble != "" {
+		if text == "" {
+			text = s.preamble
+		} else {
+			text = s.preamble + "\n" + text
+		}
+		s.preamble = ""
+	}
 	if s.exited {
 		r.Exited = true
 		c := s.exitCode
 		r.ExitCode = &c
+		r.ExitSignal = s.exitSig
 	}
 	s.mu.Unlock()
+	r.Output, r.Truncated = Truncate(text, oo.MaxBytes)
 	return r
 }
 
@@ -387,18 +544,30 @@ func (s *Session) effective(o WaitOpts) WaitOpts {
 	return o
 }
 
-// Send writes input to the process and waits for the response.
+// Send writes input to the process and waits for the response. If the
+// program is still starting, it waits for readiness first and does not write
+// anything when startup does not finish in time.
 func (s *Session) Send(ctx context.Context, input string, o SendOpts) (Result, error) {
 	if err := s.lock(); err != nil {
 		return Result{}, err
 	}
 	defer s.opMu.Unlock()
 	s.touch()
+	started := time.Now()
 	if s.Exited() {
-		r := s.result(ReasonExited, "", nil, o.Output, time.Now())
+		r := s.result(ReasonExited, "", nil, o.Output, started)
 		return r, Errorf(CodeSessionExited, "session %s has exited (code %d)", s.ID, *r.ExitCode).withResult(&r)
 	}
-	started := time.Now()
+	if r, ready := s.ensureReady(ctx, o.Wait.Timeout, o.Output, started); !ready {
+		return r, nil
+	}
+	if o.Wait.Timeout > 0 { // charge startup time against the caller's budget
+		if left := o.Wait.Timeout - time.Since(started); left > time.Second {
+			o.Wait.Timeout = left
+		} else {
+			o.Wait.Timeout = time.Second
+		}
+	}
 	if o.Newline && !strings.HasSuffix(input, "\n") {
 		input += eol(s.tty)
 	}
@@ -418,7 +587,8 @@ func (s *Session) Send(ctx context.Context, input string, o SendOpts) (Result, e
 	return s.result(reason, input, w.Prompt, o.Output, started), nil
 }
 
-// Read returns pending output, optionally waiting for more.
+// Read returns pending output, waiting for more up to w.Timeout (a Timeout
+// of zero returns immediately). Output that is already buffered counts.
 func (s *Session) Read(ctx context.Context, w WaitOpts, oo OutputOpts) (Result, error) {
 	if err := s.lock(); err != nil {
 		return Result{}, err
@@ -426,8 +596,13 @@ func (s *Session) Read(ctx context.Context, w WaitOpts, oo OutputOpts) (Result, 
 	defer s.opMu.Unlock()
 	s.touch()
 	started := time.Now()
+	if w.Timeout > 0 {
+		if r, ready := s.ensureReady(ctx, w.Timeout, oo, started); !ready {
+			return r, nil
+		}
+	}
 	w = s.effective(w)
-	reason := s.await(ctx, w, s.snapshotTotal())
+	reason := s.await(ctx, w, 0)
 	return s.result(reason, "", w.Prompt, oo, started), nil
 }
 
@@ -441,13 +616,16 @@ const (
 )
 
 // Signal delivers a signal-like action and collects the resulting output.
-func (s *Session) Signal(ctx context.Context, kind string, oo OutputOpts) (Result, error) {
+func (s *Session) Signal(ctx context.Context, kind string, wait time.Duration, oo OutputOpts) (Result, error) {
 	if err := s.lock(); err != nil {
 		return Result{}, err
 	}
 	defer s.opMu.Unlock()
 	s.touch()
 	started := time.Now()
+	if s.Exited() {
+		return Result{}, Errorf(CodeSessionExited, "session %s has already exited", s.ID)
+	}
 	startTotal := s.snapshotTotal()
 	var err error
 	switch kind {
@@ -462,35 +640,27 @@ func (s *Session) Signal(ctx context.Context, kind string, oo OutputOpts) (Resul
 	case SigSuspend:
 		err = s.proc.Suspend()
 	default:
-		return Result{}, Errorf(CodeInvalidArgument, "unknown signal %q", kind)
+		return Result{}, Errorf(CodeInvalidArgument, "unknown key %q", kind)
 	}
 	if err != nil {
 		if err == errUnsupported {
-			return Result{}, Errorf(CodeUnsupported, "signal %q is not supported for this session", kind)
+			return Result{}, Errorf(CodeUnsupported, "%s is not supported for this session", kind)
 		}
 		if s.Exited() {
-			return Result{}, Errorf(CodeSessionExited, "session %s has exited", s.ID)
+			return Result{}, Errorf(CodeSessionExited, "session %s has already exited", s.ID)
 		}
 		return Result{}, Errorf(CodeInternal, "signal failed: %v", err)
 	}
-	w := s.effective(WaitOpts{Idle: 300 * time.Millisecond, Timeout: 3 * time.Second})
+	if wait <= 0 {
+		wait = 3 * time.Second
+	}
+	w := s.effective(WaitOpts{Idle: 300 * time.Millisecond, Timeout: wait})
 	reason := s.await(ctx, w, startTotal)
 	return s.result(reason, "", w.Prompt, oo, started), nil
 }
 
-// Resize changes the terminal size.
-func (s *Session) Resize(rows, cols int) error {
-	if err := s.proc.Resize(rows, cols); err != nil {
-		if err == errUnsupported {
-			return Errorf(CodeUnsupported, "resize is not supported in %s mode", s.proc.Mode())
-		}
-		return Errorf(CodeInternal, "resize failed: %v", err)
-	}
-	return nil
-}
-
-// Kill terminates the process (gracefully first) and returns its exit code.
-func (s *Session) Kill(grace time.Duration) (code int, forced bool, final Result) {
+// Kill terminates the process (gracefully first) and returns its exit status.
+func (s *Session) Kill(grace time.Duration) (code int, sig string, forced bool, final Result) {
 	started := time.Now()
 	if !s.Exited() {
 		_ = s.proc.Terminate()
@@ -509,7 +679,7 @@ func (s *Session) Kill(grace time.Duration) (code int, forced bool, final Result
 	defer s.opMu.Unlock()
 	final = s.result(ReasonExited, "", nil, OutputOpts{StripANSI: true, MaxBytes: 65536}, started)
 	s.mu.Lock()
-	code = s.exitCode
+	code, sig = s.exitCode, s.exitSig
 	s.mu.Unlock()
-	return code, forced, final
+	return code, sig, forced, final
 }
