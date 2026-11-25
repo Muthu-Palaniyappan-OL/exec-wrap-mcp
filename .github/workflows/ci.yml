@@ -47,6 +47,8 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -d . && exit 1)
       - name: govulncheck
+        env:
+          GOTOOLCHAIN: auto
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   cross-build:
