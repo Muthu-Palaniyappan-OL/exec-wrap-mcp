@@ -1,0 +1,29 @@
+name: Dependabot sweep
+
+# Safety net so nobody ever has to comment or click: every few hours, make sure
+# each open Dependabot PR is up to date and has auto-merge enabled.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sweep:
+    if: github.repository == 'Muthu-Palaniyappan-OL/exec-wrap-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Enable auto-merge and refresh stale branches
+        run: |
+          for pr in $(gh pr list --author "app/dependabot" --state open --json number --jq '.[].number'); do
+            echo "PR #$pr"
+            gh pr update-branch "$pr" || true
+            gh pr merge "$pr" --auto --squash || true
+          done

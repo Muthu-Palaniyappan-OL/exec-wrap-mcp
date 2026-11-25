@@ -14,13 +14,19 @@ git push origin v0.2.0
 
 The `Release` workflow runs GoReleaser: it builds linux/darwin/windows for amd64 and arm64 (`CGO_ENABLED=0`, `-trimpath`), publishes archives and `checksums.txt`, and writes release notes from Conventional Commit messages. `go install ...@v0.2.0` works as soon as the tag exists.
 
+## CI cost
+
+Every push and PR runs a single Ubuntu job. The macOS and Windows end-to-end tests live in `cross-os.yml` and run only weekly, manually (Actions tab → *Cross-OS tests* → *Run workflow*), or when a PR gets the `test-all-os` label. Run them before a release if you changed process or terminal handling.
+
 ## Dependabot
 
 `.github/dependabot.yml` checks Go modules daily and GitHub Actions weekly.
 
 `.github/workflows/dependabot-automerge.yml` enables squash auto-merge on every Dependabot PR: patch, minor and major version bumps, and security updates (the ones that carry a GHSA/CVE id). Major bumps also get a `major-update` label so they are easy to spot in the history.
 
-"Auto-merge" means GitHub merges the PR only after the required status check `ci-ok` passes (Linux, macOS and Windows tests, `govulncheck`, cross-compilation, `goreleaser check`). A failing update is never merged.
+A scheduled sweep (`dependabot-sweep.yml`, every 6 hours) re-enables auto-merge and refreshes the branch of any open Dependabot PR that missed it, so nothing needs a manual comment.
+
+"Auto-merge" means GitHub merges the PR only after the required status check `ci-ok` passes (one Linux job: gofmt, vet, race tests, a macOS/Windows compile check and `govulncheck`). A failing update is never merged.
 
 Repository settings this relies on (already applied by the maintainer):
 

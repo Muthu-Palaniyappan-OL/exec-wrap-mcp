@@ -181,7 +181,7 @@ Wrapping something else? Pass `prompt_regex`, e.g. `"mysql> \\z"`, or leave it a
 | Linux, macOS (and other unix) | pseudo-terminal | Each session is its own process group; signals reach the whole job. |
 | Windows 10 1809+ | ConPTY | Falls back to pipes if ConPTY is not available. |
 
-It is a single static binary (`CGO_ENABLED=0`). CI runs the full end-to-end suite on Ubuntu, macOS and Windows.
+It is a single static binary (`CGO_ENABLED=0`). CI runs the end-to-end suite on Linux for every change, and on macOS and Windows weekly and on demand.
 
 ## Server flags
 

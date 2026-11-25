@@ -10,6 +10,7 @@ updates:
       go-minor-patch:
         update-types: [minor, patch]
     open-pull-requests-limit: 10
+    rebase-strategy: auto
 
   - package-ecosystem: github-actions
     directory: /
