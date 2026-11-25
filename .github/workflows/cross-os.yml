@@ -1,11 +1,9 @@
 name: Cross-OS tests
 
 # macOS and Windows runners are slow and costly, so they never run on every
-# push. Trigger them manually, weekly, or by adding the `test-all-os` label to a PR.
+# push. Trigger them manually or by adding the `test-all-os` label to a PR.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1"
   pull_request:
     types: [labeled]
 

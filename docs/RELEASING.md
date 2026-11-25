@@ -16,7 +16,7 @@ The `Release` workflow runs GoReleaser: it builds linux/darwin/windows for amd64
 
 ## CI cost
 
-Every push and PR runs a single Ubuntu job. The macOS and Windows end-to-end tests live in `cross-os.yml` and run only weekly, manually (Actions tab → *Cross-OS tests* → *Run workflow*), or when a PR gets the `test-all-os` label. Run them before a release if you changed process or terminal handling.
+Every push and PR runs a single Ubuntu job. The macOS and Windows end-to-end tests live in `cross-os.yml` and run only manually (Actions tab → *Cross-OS tests* → *Run workflow*), or when a PR gets the `test-all-os` label. Run them before a release if you changed process or terminal handling.
 
 ## Dependabot
 
