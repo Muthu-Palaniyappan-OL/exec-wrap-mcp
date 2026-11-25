@@ -18,11 +18,7 @@ The `Release` workflow runs GoReleaser: it builds linux/darwin/windows for amd64
 
 `.github/dependabot.yml` checks Go modules daily and GitHub Actions weekly.
 
-`.github/workflows/dependabot-automerge.yml` handles every Dependabot PR:
-
-- patch and minor updates: auto-merge (squash) is enabled;
-- updates that fix a known vulnerability (they carry a GHSA/CVE id): auto-merge is enabled, even for a major version;
-- other major updates: labelled `needs-review`, merged by a human.
+`.github/workflows/dependabot-automerge.yml` enables squash auto-merge on every Dependabot PR: patch, minor and major version bumps, and security updates (the ones that carry a GHSA/CVE id). Major bumps also get a `major-update` label so they are easy to spot in the history.
 
 "Auto-merge" means GitHub merges the PR only after the required status check `ci-ok` passes (Linux, macOS and Windows tests, `govulncheck`, cross-compilation, `goreleaser check`). A failing update is never merged.
 
@@ -31,3 +27,5 @@ Repository settings this relies on (already applied by the maintainer):
 - Settings → General → *Allow auto-merge* on;
 - branch protection on `main` requiring the `ci-ok` check;
 - Dependabot alerts and Dependabot security updates on.
+
+The merge gate is CI. If you want a human to look at major updates, remove the auto-merge step for them in the workflow.

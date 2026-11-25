@@ -237,7 +237,7 @@ go test -race ./...          # unit tests + end-to-end tests that drive the real
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Releases follow [Semantic Versioning](https://semver.org); while the version is `0.x`, tool schemas may still change between minor versions.
-Dependencies are kept current by Dependabot, which opens a pull request for every update and merges it automatically once CI passes (see [docs/RELEASING.md](docs/RELEASING.md)).
+Dependencies are kept current by Dependabot, which opens a pull request for every update and merges it automatically once CI passes (security fixes included) (see [docs/RELEASING.md](docs/RELEASING.md)).
 
 ## FAQ
 
